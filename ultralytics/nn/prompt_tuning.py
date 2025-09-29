@@ -182,16 +182,13 @@ class COOPPromptTuner(TextModel):
     # ------------------------------------------------------------------
     # Persistence helpers
     # ------------------------------------------------------------------
-    def save_state(self, path: str | Path) -> Path:
+    def get_state(self) -> dict:
+        """Return an in-memory snapshot of the current prompt tuner state."""
+
         if self.context is None or self.tokenized_prompts is None:
-            raise RuntimeError("Prompt tuner must be fitted before saving state.")
+            raise RuntimeError("Prompt tuner must be fitted before exporting state.")
 
-        path = Path(path)
-        if path.suffix == "":
-            path = path / "coop_prompt_state.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        state = {
+        return {
             "base_variant": self.base_variant,
             "ctx_len": self.ctx_len,
             "template": self.template,
@@ -201,6 +198,15 @@ class COOPPromptTuner(TextModel):
             "optimizer_state": self.optimizer.state_dict() if self.optimizer is not None else None,
             "lr": self.last_lr,
         }
+
+    def save_state(self, path: str | Path) -> Path:
+        state = self.get_state()
+
+        path = Path(path)
+        if path.suffix == "":
+            path = path / "coop_prompt_state.pt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+
         torch.save(state, path)
         LOGGER.info(f"Saved CoOp prompt tuner state to {path}")
         return path
@@ -208,26 +214,33 @@ class COOPPromptTuner(TextModel):
     def load_state(self, path: str | Path, map_location: Optional[str | torch.device] = None) -> None:
         path = Path(path)
         state = torch.load(path, map_location=map_location)
-        if state.get("base_variant") != self.base_variant:
+        self.load_state_dict(state, map_location=map_location)
+        LOGGER.info(f"Loaded CoOp prompt tuner state from {path}")
+
+    def load_state_dict(self, state: dict, map_location: Optional[str | torch.device] = None) -> None:
+        target_device = map_location or self.device
+
+        if state.get("base_variant") not in {None, self.base_variant}:
             raise ValueError(
                 f"State was trained for base variant {state.get('base_variant')} but current tuner uses {self.base_variant}."
             )
 
         self.ctx_len = state.get("ctx_len", self.ctx_len)
         self.template = state.get("template", self.template)
+
         tokenized_prompts = state.get("tokenized_prompts")
         class_names = state.get("class_names")
         if class_names is None or tokenized_prompts is None:
-            raise ValueError("State file is missing required prompt metadata.")
+            raise ValueError("State dictionary is missing required prompt metadata.")
 
-        self._initialize_prompts(class_names, tokenized_prompts.to(self.device))
-        self.context.data.copy_(state["context"].to(self.device))
+        tokenized_prompts = tokenized_prompts.to(target_device)
+        self._initialize_prompts(class_names, tokenized_prompts)
+        self.context.data.copy_(state["context"].to(target_device))
 
         self.last_lr = state.get("lr", self.last_lr)
-        if state.get("optimizer_state") is not None:
+        optimizer_state = state.get("optimizer_state")
+        if optimizer_state is not None:
             self.optimizer = torch.optim.Adam([self.context], lr=self.last_lr or 1e-3)
-            self.optimizer.load_state_dict(state["optimizer_state"])
+            self.optimizer.load_state_dict(optimizer_state)
         else:
             self.optimizer = None
-
-        LOGGER.info(f"Loaded CoOp prompt tuner state from {path}")

@@ -6,6 +6,7 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -90,6 +91,7 @@ from ultralytics.utils.torch_utils import (
     smart_inference_mode
 )
 from ultralytics.nn.autobackend import check_class_names
+from ultralytics.nn.prompt_tuning import COOPPromptTuner
 
 try:
     import thop
@@ -622,8 +624,142 @@ class YOLOEModel(DetectionModel):
         self.prompt_tuner = None
         self._clip_model_variant = None
         self._prompt_tuner_variant = None
+        self.coop_tuner: Optional[COOPPromptTuner] = None
+        self._coop_tuner_signature: Optional[Tuple[Any, ...]] = None
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
-    
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _get_arg(self, key: str, default: Any = None) -> Any:
+        if isinstance(self.args, dict):
+            return self.args.get(key, default)
+        return getattr(self.args, key, default)
+
+    def _get_coop_tuner(self, tuner_cfg: Optional[Dict[str, Any]] = None) -> Tuple[COOPPromptTuner, Dict[str, Any]]:
+        cfg = dict(tuner_cfg or {})
+
+        base_variant = cfg.pop("base_variant", None) or cfg.pop("variant", None) or self._get_arg("text_model")
+        if base_variant is None:
+            raise ValueError("A base text model variant is required to build the CoOp prompt tuner.")
+
+        ctx_len = cfg.pop("ctx_len", None)
+        if ctx_len is None:
+            ctx_len = self._get_arg("coop_ctx_len", 16)
+
+        template = cfg.pop("template", None) or self._get_arg("coop_template", "a photo of a {}")
+        device = cfg.pop("device", None)
+        if device is None:
+            device = next(self.parameters()).device
+        device = torch.device(device)
+
+        signature = (base_variant, int(ctx_len), template, device.type, device.index)
+        tuner = self.coop_tuner if self.coop_tuner and self._coop_tuner_signature == signature else None
+        if tuner is None:
+            tuner = COOPPromptTuner(base_variant, device=device, ctx_len=int(ctx_len), template=template)
+            self.coop_tuner = tuner
+            self._coop_tuner_signature = signature
+        else:
+            tuner.to(device)
+
+        map_location = cfg.pop("map_location", device)
+        state_path = cfg.pop("state_path", None)
+        state = cfg.pop("state", None)
+        if state_path is not None:
+            tuner.load_state(state_path, map_location=map_location)
+        elif state is not None:
+            tuner.load_state_dict(state, map_location=map_location)
+
+        return tuner, cfg
+
+    def _collect_support_examples(
+        self, support_crops: Any
+    ) -> List[Tuple[torch.Tensor, int]]:
+        examples: List[Tuple[torch.Tensor, int]] = []
+
+        if support_crops is None:
+            return examples
+
+        def _append_from_tensors(images: torch.Tensor, labels: torch.Tensor) -> None:
+            if images.ndim != 4:
+                raise ValueError("Support image tensors must have shape (N, C, H, W).")
+            if labels.ndim == 2 and labels.shape[1] == 1:
+                labels = labels.squeeze(1)
+            if labels.ndim != 1:
+                raise ValueError("Support labels must be a 1D tensor after squeezing.")
+            for img, label in zip(images, labels):
+                if int(label) < 0:
+                    continue
+                tensor = img.detach()
+                if tensor.ndim == 4:
+                    tensor = tensor.squeeze(0)
+                examples.append((tensor, int(label)))
+
+        if isinstance(support_crops, dict):
+            images = support_crops.get("images")
+            labels = support_crops.get("cls")
+            if images is None or labels is None:
+                return examples
+            if images.ndim == 5:
+                for img_batch, label_batch in zip(images, labels):
+                    _append_from_tensors(img_batch, label_batch)
+            elif images.ndim == 4:
+                _append_from_tensors(images, labels)
+            else:
+                raise ValueError("Unsupported support image tensor dimensionality.")
+            return examples
+
+        if isinstance(support_crops, Sequence):
+            for entry in support_crops:
+                if isinstance(entry, dict):
+                    examples.extend(self._collect_support_examples(entry))
+                else:
+                    image, label = entry
+                    tensor = image.detach() if isinstance(image, torch.Tensor) else torch.as_tensor(image)
+                    if tensor.ndim == 3:
+                        examples.append((tensor, int(label)))
+                    elif tensor.ndim == 4 and tensor.shape[0] == 1:
+                        examples.append((tensor.squeeze(0), int(label)))
+                    else:
+                        raise ValueError("Support examples must be 3D image tensors.")
+            return examples
+
+        raise ValueError("Unsupported support crop container type.")
+
+    def _resolve_prompt_override(
+        self,
+        embeddings: Optional[torch.Tensor] = None,
+        tuned_pe: Optional[torch.Tensor] = None,
+        tuner_state: Optional[Union[Dict[str, Any], str, Path]] = None,
+        tuner_cfg: Optional[Dict[str, Any]] = None,
+        class_names: Optional[Sequence[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[COOPPromptTuner]]:
+        if tuned_pe is not None:
+            resolved = tuned_pe
+            tuner = self.coop_tuner
+        elif tuner_state is not None:
+            cfg = dict(tuner_cfg or {})
+            if isinstance(tuner_state, (str, Path)):
+                cfg["state_path"] = tuner_state
+            else:
+                cfg["state"] = tuner_state
+            tuner, cfg = self._get_coop_tuner(cfg)
+            resolved = tuner.get_text_features(dtype=torch.float32).unsqueeze(0)
+            if class_names is not None and tuner.class_names is not None:
+                tuner.class_names = list(class_names)
+        elif embeddings is not None:
+            resolved = embeddings
+            tuner = self.coop_tuner
+        else:
+            return None, None
+
+        if resolved.ndim == 2:
+            resolved = resolved.unsqueeze(0)
+        if resolved.ndim != 3:
+            raise ValueError("Prompt embeddings must have shape (B, C, D) after processing.")
+
+        return resolved, tuner
+
     @smart_inference_mode()
     def get_text_pe(self, text, batch=80, cache_clip_model=False):
         assert(not self.training)
@@ -662,6 +798,41 @@ class YOLOEModel(DetectionModel):
     def get_visual_pe(self, img, visual):
         return self(img, vpe=visual, return_vpe=True)
 
+    def tune_with_visual_support(
+        self,
+        support_crops: Any,
+        class_names: Sequence[str],
+        tuner_cfg: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, COOPPromptTuner]:
+        """Tune prompt embeddings using visual support crops and update the model state."""
+
+        class_names = list(class_names)
+        support_examples = self._collect_support_examples(support_crops)
+        if len(support_examples) == 0:
+            raise ValueError("support_crops must contain at least one labeled example.")
+
+        cfg = dict(tuner_cfg or {})
+        steps = int(cfg.pop("steps", cfg.pop("num_steps", self._get_arg("coop_tuner_steps", 200))))
+        lr = float(cfg.pop("lr", cfg.pop("learning_rate", self._get_arg("coop_tuner_lr", 1e-3))))
+        tuner, _ = self._get_coop_tuner(cfg)
+
+        device = next(self.parameters()).device
+        prepared_examples = []
+        for image, label in support_examples:
+            tensor = image.to(device=device, dtype=torch.float32)
+            if tensor.max() > 1.0:
+                tensor = tensor / 255.0
+            if tensor.ndim != 3:
+                raise ValueError("Support crops must be 3D tensors with shape (C, H, W).")
+            prepared_examples.append((tensor.unsqueeze(0), label))
+
+        tuned_features = tuner.fit(prepared_examples, class_names, steps=steps, lr=lr)
+        tuned_embeddings = tuned_features.unsqueeze(0)
+        self.set_classes(class_names, embeddings=tuned_embeddings)
+        self.coop_tuner = tuner
+        tuner.class_names = class_names
+        return tuned_embeddings, tuner
+
     def set_vocab(self, vocab, names):
         assert(not self.training)
         head = self.model[-1]
@@ -696,12 +867,32 @@ class YOLOEModel(DetectionModel):
             vocab.append(cls_head[-1])
         return vocab
 
-    def set_classes(self, names, embeddings):
+    def set_classes(
+        self,
+        names: Sequence[str],
+        embeddings: Optional[torch.Tensor] = None,
+        tuned_pe: Optional[torch.Tensor] = None,
+        tuner_state: Optional[Union[Dict[str, Any], str, Path]] = None,
+        tuner_cfg: Optional[Dict[str, Any]] = None,
+    ):
         """Set classes in advance so that model could do offline-inference without clip model."""
-        assert(embeddings.ndim == 3)
-        self.pe = embeddings
+        resolved, tuner = self._resolve_prompt_override(
+            embeddings=embeddings,
+            tuned_pe=tuned_pe,
+            tuner_state=tuner_state,
+            tuner_cfg=tuner_cfg,
+            class_names=names,
+        )
+        if resolved is None:
+            raise ValueError("A valid prompt embedding or tuner state must be provided.")
+
+        device = next(self.parameters()).device
+        self.pe = resolved.to(device=device, dtype=torch.float32)
         self.model[-1].nc = len(names)
         self.names = check_class_names(names)
+        if tuner is not None:
+            self.coop_tuner = tuner
+            self.coop_tuner.class_names = list(self.names)
 
     def get_cls_pe(self, tpe, vpe):
         all_pe = []
@@ -715,8 +906,20 @@ class YOLOEModel(DetectionModel):
             all_pe.append(getattr(self, 'pe', torch.zeros(1, 80, 512)))
         return torch.cat(all_pe, dim=1)
 
-    def predict(self, x, profile=False, visualize=False, tpe=None, \
-        augment=False, embed=None, vpe=None, return_vpe=False):
+    def predict(
+        self,
+        x,
+        profile=False,
+        visualize=False,
+        tpe=None,
+        augment=False,
+        embed=None,
+        vpe=None,
+        return_vpe=False,
+        tuned_pe: Optional[torch.Tensor] = None,
+        tuner_state: Optional[Union[Dict[str, Any], str, Path]] = None,
+        tuner_cfg: Optional[Dict[str, Any]] = None,
+    ):
         """
         Perform a forward pass through the model.
 
@@ -727,26 +930,39 @@ class YOLOEModel(DetectionModel):
             txt_feats (torch.Tensor): The text features, use it if it's given. Defaults to None.
             augment (bool, optional): If True, perform data augmentation during inference. Defaults to False.
             embed (list, optional): A list of feature vectors/embeddings to return.
+            tuned_pe (torch.Tensor, optional): Temporarily override text prompts with tuned embeddings.
+            tuner_state (dict | str | Path, optional): Load tuned prompts from a serialized tuner state.
+            tuner_cfg (dict, optional): Additional configuration for loading prompt tuner states.
 
         Returns:
             (torch.Tensor): Model's output tensor.
-        """            
+        """
         y, dt, embeddings = [], [], []  # outputs
         b = x.shape[0]
+        text_override, _ = self._resolve_prompt_override(
+            tuned_pe=tuned_pe,
+            tuner_state=tuner_state,
+            tuner_cfg=tuner_cfg,
+            class_names=getattr(self, "names", None),
+        )
         for m in self.model:  # except the head part
             if m.f != -1:  # if not from previous layer
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
             if profile:
                 self._profile_one_layer(m, x, dt)
             if isinstance(m, C2fAttn):
-                x = m(x, tpe or getattr(self, 'pe', torch.zeros(1, 80, 512)).to(x.device))
+                pe_source = text_override if text_override is not None else tpe or getattr(self, 'pe', torch.zeros(1, 80, 512))
+                x = m(x, pe_source.to(x.device))
             elif isinstance(m, YOLOEDetect):
                 vpe = m.get_vpe(x, vpe) if vpe is not None else None
                 if return_vpe:
                     assert(vpe is not None)
                     assert(not self.training)
                     return vpe
-                cls_pe = self.get_cls_pe(m.get_tpe(tpe), vpe).to(device=x[0].device, dtype=x[0].dtype)
+                text_prompt = text_override if text_override is not None else tpe
+                if text_prompt is not None:
+                    text_prompt = text_prompt.to(device=x[0].device, dtype=x[0].dtype)
+                cls_pe = self.get_cls_pe(m.get_tpe(text_prompt), vpe).to(device=x[0].device, dtype=x[0].dtype)
                 if len(cls_pe) != b:
                     cls_pe = cls_pe.repeat(b, 1, 1)
                 x = m(x, cls_pe)

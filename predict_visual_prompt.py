@@ -43,3 +43,7 @@ model.predict(source_image, prompts=visuals, predictor=YOLOEVPSegPredictor,
 model.set_classes(["object0", "object1"], model.predictor.vpe)
 model.predictor = None  # remove VPPredictor
 model.predict(target_image, save=True)
+
+# To tune text prompts from a single visual prompt image instead of manual arrays:
+# from PIL import Image
+# model.tune_text_prompt(Image.open(source_image), visuals["bboxes"][0], ["object0", "object1"])
