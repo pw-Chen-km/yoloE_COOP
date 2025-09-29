@@ -127,5 +127,6 @@ tracker: botsort.yaml # (str) tracker type, choices=[botsort.yaml, bytetrack.yam
 
 val_interval: 20
 text_model: mobileclip:blt
+text_prompt_tuner: null
 load_vp: False
 train_pe_path: None

@@ -619,28 +619,41 @@ class YOLOEModel(DetectionModel):
         # Randomness
         # self.txt_feats = torch.randn(1, nc or 80, 512)  # features placeholder
         self.clip_model = None  # CLIP model placeholder
+        self.prompt_tuner = None
+        self._clip_model_variant = None
+        self._prompt_tuner_variant = None
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
     
     @smart_inference_mode()
     def get_text_pe(self, text, batch=80, cache_clip_model=False):
         assert(not self.training)
-        
+
         """Set classes in advance so that model could do offline-inference without clip model."""
         from ultralytics.nn.text_model import build_text_model
-        
+
         device = next(self.model.parameters()).device
-        
+
         text_model = self.args.get("text_model")
-        if (
-            not getattr(self, "clip_model", None) and cache_clip_model
-        ):  # for backwards compatibility of models lacking clip_model attribute
-            self.clip_model = build_text_model(text_model, device=device)
-            
-        model = self.clip_model if cache_clip_model else build_text_model(text_model, device=device)
+        tuner_name = self.args.get("text_prompt_tuner")
+        use_tuner = isinstance(tuner_name, str) and tuner_name.lower() not in {"", "none", "null"}
+        variant = f"{tuner_name}:{text_model}" if use_tuner else text_model
+        cache_attr = "prompt_tuner" if use_tuner else "clip_model"
+        cache_variant_attr = "_prompt_tuner_variant" if use_tuner else "_clip_model_variant"
+
+        if cache_clip_model:
+            cached_model = getattr(self, cache_attr, None)
+            cached_variant = getattr(self, cache_variant_attr, None)
+            if cached_model is None or cached_variant != variant:
+                setattr(self, cache_attr, build_text_model(variant, device=device))
+                setattr(self, cache_variant_attr, variant)
+            model = getattr(self, cache_attr)
+        else:
+            model = build_text_model(variant, device=device)
+
         text_token = model.tokenize(text)
         txt_feats = model.encode_text(text_token)
         txt_feats = txt_feats.reshape(-1, len(text), txt_feats.shape[-1])
-        
+
         head = self.model[-1]
         assert(isinstance(head, YOLOEDetect))
         return head.get_tpe(txt_feats)
