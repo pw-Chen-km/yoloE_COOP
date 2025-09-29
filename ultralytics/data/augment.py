@@ -12,6 +12,7 @@ from PIL import Image
 from torch.nn import functional as F
 
 from ultralytics.data.utils import polygons2masks, polygons2masks_overlap
+from ultralytics.data.visual_prompt_utils import extract_support_crops
 from ultralytics.utils import LOGGER, colorstr
 from ultralytics.utils.checks import check_version
 from ultralytics.utils.instance import Instances
@@ -2135,11 +2136,12 @@ class Format:
 
 
 class LoadVisualPrompt:
-    def __init__(self, nc, augment):
+    def __init__(self, nc, augment, support_output_size=224):
         self.nc = nc
         self.min_interval = 5
         self.augment = augment
         self.scale_factor = 1/8
+        self.support_output_size = support_output_size
     
     def make_mask(self, boxes, h, w):
         x1, y1, x2, y2 = torch.chunk(boxes[:, :, None], 4, 1)  # x1 shape(n,1,1)
@@ -2162,7 +2164,7 @@ class LoadVisualPrompt:
         else:
             raise ValueError("LoadVisualPrompt must have bboxes or masks in the label")
 
-        cls = labels["cls"].squeeze(-1).to(torch.int)
+        cls = labels["cls"].squeeze(-1).to(torch.long)
         if len(cls):
             visuals = torch.zeros(cls.max() + 1, *masksz)
             for idx, mask in zip(cls, masks):
@@ -2171,6 +2173,15 @@ class LoadVisualPrompt:
             visuals = torch.zeros(0, *masksz)
         # visuals[0] = masks[random.choice(range(len(masks)))]
         labels["visuals"] = visuals
+
+        support_crops, crop_indices = extract_support_crops(
+            labels["img"], labels["bboxes"], self.support_output_size
+        )
+        if crop_indices.numel():
+            support_cls = cls[crop_indices]
+        else:
+            support_cls = cls.new_empty((0,))
+        labels["vp_crops"] = {"images": support_crops, "cls": support_cls}
         return labels
 
 class RandomLoadText:

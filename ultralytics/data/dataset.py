@@ -250,6 +250,53 @@ class YOLODataset(BaseDataset):
                 value = torch.stack(value, 0)
             if k == "visuals":
                 value = torch.nn.utils.rnn.pad_sequence(value, batch_first=True)
+            if k == "vp_crops":
+                crops_list = [item["images"] for item in value]
+                cls_list = [item["cls"] for item in value]
+                max_crops = max((crops.shape[0] for crops in crops_list), default=0)
+                if crops_list:
+                    sample_shape = crops_list[0].shape[1:] if crops_list[0].ndim == 4 else (0, 0, 0)
+                    for crops in crops_list:
+                        if crops.shape[0] and crops.ndim == 4:
+                            sample_shape = crops.shape[1:]
+                            break
+                    channels, crop_h, crop_w = sample_shape
+                    dtype = crops_list[0].dtype if crops_list[0].ndim == 4 else torch.float32
+                    device = crops_list[0].device if crops_list[0].ndim == 4 else torch.device("cpu")
+                else:
+                    channels = crop_h = crop_w = 0
+                    dtype = torch.float32
+                    device = torch.device("cpu")
+
+                stacked_crops = []
+                stacked_cls = []
+                for crops_tensor, cls_tensor in zip(crops_list, cls_list):
+                    if crops_tensor.ndim != 4:
+                        raise ValueError("vp_crops['images'] must be a 4D tensor per sample.")
+                    if cls_tensor.ndim == 2 and cls_tensor.shape[1] == 1:
+                        cls_tensor = cls_tensor.squeeze(1)
+                    cls_tensor = cls_tensor.to(torch.long)
+                    if max_crops:
+                        pad_crops = max_crops - crops_tensor.shape[0]
+                        if pad_crops:
+                            pad_shape = (pad_crops, channels, crop_h, crop_w)
+                            pad_tensor = torch.zeros(pad_shape, dtype=crops_tensor.dtype, device=crops_tensor.device)
+                            crops_tensor = torch.cat([crops_tensor, pad_tensor], dim=0)
+                        pad_cls = max_crops - cls_tensor.shape[0]
+                        if pad_cls:
+                            cls_padding = torch.full((pad_cls,), -1, dtype=torch.long, device=cls_tensor.device)
+                            cls_tensor = torch.cat([cls_tensor, cls_padding], dim=0)
+                    stacked_crops.append(crops_tensor)
+                    stacked_cls.append(cls_tensor)
+
+                if stacked_crops:
+                    crops_tensor = torch.stack(stacked_crops, dim=0)
+                    cls_tensor = torch.stack(stacked_cls, dim=0)
+                else:
+                    crops_tensor = torch.zeros((0, max_crops, channels, crop_h, crop_w), dtype=dtype, device=device)
+                    cls_tensor = torch.zeros((0, max_crops), dtype=torch.long, device=device)
+
+                value = {"images": crops_tensor, "cls": cls_tensor}
             if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
@@ -288,9 +335,23 @@ class YOLOMultiModalDataset(YOLODataset):
     def build_transforms(self, hyp=None):
         """Enhances data transformations with optional text augmentation for multi-modal training."""
         transforms = super().build_transforms(hyp)
+        cfg = hyp or {}
+        if isinstance(cfg, dict):
+            coop_support = cfg.get("coop_support", False) or cfg.get("load_vp", False)
+        else:
+            coop_support = getattr(cfg, "coop_support", False) or getattr(cfg, "load_vp", False)
+        if coop_support and not any(isinstance(t, LoadVisualPrompt) for t in transforms):
+            if not self.augment:
+                assert self.batch_size == 1
+                nc = len(self.data["names"])
+            else:
+                nc = 80
+            transforms.append(LoadVisualPrompt(nc=nc, augment=self.augment))
+
+        has_vp_transform = any(isinstance(t, LoadVisualPrompt) for t in transforms)
         if self.augment and not self.single_cls:
             # NOTE: hard-coded the args for now.
-            index = -2 if self.load_vp else -1
+            index = -2 if has_vp_transform else -1
             transforms.insert(index, RandomLoadText(text_model=hyp.text_model, max_samples=min(self.data["nc"], 80), padding=True))
         return transforms
 
