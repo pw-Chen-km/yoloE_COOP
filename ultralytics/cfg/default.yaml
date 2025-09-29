@@ -130,3 +130,10 @@ text_model: mobileclip:blt
 text_prompt_tuner: null
 load_vp: False
 train_pe_path: None
+coop_tuner_state: null
+coop_tuner_save_path: null
+coop_tuner_steps: 200
+coop_tuner_lr: 0.001
+coop_ctx_len: 16
+coop_template: "a photo of a {}"
+coop_support_size: 224
