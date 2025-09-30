@@ -1246,6 +1246,12 @@ def attempt_load_one_weight(weight, device=None, inplace=True, fuse=False):
     args = {**DEFAULT_CFG_DICT, **(ckpt.get("train_args", {}))}  # combine model and default args, preferring model args
     model = (ckpt.get("ema") or ckpt["model"]).to(device).float()  # FP32 model
 
+    if isinstance(model, YOLOEModel):
+        if not hasattr(model, "coop_tuner"):
+            model.coop_tuner = None
+        if not hasattr(model, "_coop_tuner_signature"):
+            model._coop_tuner_signature = None
+
     # Model compatibility updates
     model.args = {k: v for k, v in args.items() if k in DEFAULT_CFG_KEYS}  # attach args to model
     model.pt_path = weight  # attach *.pt file path to model
