@@ -38,9 +38,27 @@ class COOPPromptTuner(TextModel):
         self.template = template
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.base_model = build_text_model(base_variant, device=self.device, allow_tuner=False)
-        self.text_encoder = self.base_model.model
-        if not hasattr(self.text_encoder, "token_embedding"):
+        self.model = self.base_model.model
+
+        # Detect whether we are working with a standard CLIP model (which exposes the text encoder
+        # directly) or a MobileCLIP style model which nests the encoder under ``text_encoder``.
+        self._is_mobileclip = False
+
+        if hasattr(self.model, "token_embedding"):
+            self.text_encoder = self.model
+            self._token_embedding_layer = self.text_encoder.token_embedding
+        elif hasattr(self.model, "text_encoder"):
+            self._is_mobileclip = True
+            self.text_encoder = self.model.text_encoder
+            if not hasattr(self.text_encoder, "embedding_layer"):
+                raise AttributeError(
+                    "MobileCLIP text encoder must expose an 'embedding_layer' for CoOp prompt tuning."
+                )
+            self._token_embedding_layer = self.text_encoder.embedding_layer
+        else:
             raise AttributeError("Base text encoder must expose token embeddings for CoOp prompt tuning.")
+
+        self._dropout = getattr(self.text_encoder, "dropout", None)
         self.context: Optional[nn.Parameter] = None
         self.optimizer: Optional[torch.optim.Optimizer] = None
         self.class_names: Optional[List[str]] = None
@@ -71,6 +89,11 @@ class COOPPromptTuner(TextModel):
         else:
             self.register_buffer(name, value)
 
+    def _embed_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self._token_embedding_layer is None:
+            raise RuntimeError("Token embedding layer has not been initialized.")
+        return self._token_embedding_layer(tokens)
+
     def _initialize_prompts(
         self,
         class_names: Sequence[str],
@@ -81,7 +104,7 @@ class COOPPromptTuner(TextModel):
         tokens = tokenized_prompts if tokenized_prompts is not None else self.base_model.tokenize(prompts)
         tokens = tokens.to(self.device)
 
-        token_embedding = self.text_encoder.token_embedding(tokens).to(self.device)
+        token_embedding = self._embed_tokens(tokens).to(self.device)
         dtype = token_embedding.dtype
 
         ctx_init = token_embedding[:, 1 : 1 + self.ctx_len]
@@ -112,6 +135,15 @@ class COOPPromptTuner(TextModel):
     def get_text_features(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         assert self.tokenized_prompts is not None and self.context is not None
         prompts = self._build_prompts().to(self.device)
+        if self._is_mobileclip:
+            text_features = self._get_text_features_mobileclip(prompts, dtype)
+        else:
+            text_features = self._get_text_features_clip(prompts, dtype)
+        text_features = text_features.to(dtype)
+        text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
+        return text_features
+
+    def _get_text_features_clip(self, prompts: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         model_dtype = getattr(self.text_encoder, "dtype", prompts.dtype)
         prompts = prompts.to(model_dtype)
         positional = self.text_encoder.positional_embedding.to(model_dtype)
@@ -124,8 +156,32 @@ class COOPPromptTuner(TextModel):
         assert eot is not None
         batch_indices = torch.arange(x.shape[0], device=x.device)
         x = x[batch_indices, eot.to(x.device)] @ self.text_encoder.text_projection
-        x = x.to(dtype)
-        x = x / x.norm(p=2, dim=-1, keepdim=True)
+        return x
+
+    def _get_text_features_mobileclip(self, prompts: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        model_dtype = getattr(self.text_encoder, "dtype", prompts.dtype)
+        prompts = prompts.to(model_dtype)
+        positional = self.text_encoder.positional_embedding.to(model_dtype)
+        x = prompts + positional
+        if self._dropout is not None:
+            x = self._dropout(x)
+        transformer_layers = getattr(self.text_encoder, "transformer_layers", None)
+        if transformer_layers is None:
+            raise AttributeError("MobileCLIP text encoder must define 'transformer_layers'.")
+        for layer in transformer_layers:
+            x = layer(x)
+        final_layer_norm = getattr(self.text_encoder, "final_layer_norm", None)
+        if final_layer_norm is None:
+            raise AttributeError("MobileCLIP text encoder must define 'final_layer_norm'.")
+        x = final_layer_norm(x)
+        eot = self.eot_indices
+        assert eot is not None
+        batch_indices = torch.arange(x.shape[0], device=x.device)
+        x = x[batch_indices, eot.to(x.device)]
+        projection_layer = getattr(self.text_encoder, "projection_layer", None)
+        if projection_layer is None:
+            raise AttributeError("MobileCLIP text encoder must define 'projection_layer'.")
+        x = projection_layer(x)
         return x
 
     # ------------------------------------------------------------------
@@ -159,14 +215,22 @@ class COOPPromptTuner(TextModel):
 
         with torch.no_grad():
             image_batch = torch.cat([ex.image for ex in examples], dim=0).to(self.device)
-            image_features = self.text_encoder.encode_image(image_batch)
+            image_encoder = getattr(self.model, "encode_image", None)
+            if image_encoder is None:
+                raise AttributeError("Base model must expose an 'encode_image' method for CoOp prompt tuning.")
+            image_features = image_encoder(image_batch)
             image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
             labels = torch.tensor([ex.label for ex in examples], device=self.device, dtype=torch.long)
 
         self.last_lr = lr
         self.optimizer = torch.optim.Adam([self.context], lr=lr)
 
-        logit_scale = self.text_encoder.logit_scale.exp().item()
+        logit_scale_param = getattr(self.model, "logit_scale", None)
+        if logit_scale_param is None:
+            logit_scale_param = getattr(self.text_encoder, "logit_scale", None)
+        if logit_scale_param is None:
+            raise AttributeError("Base model must expose a 'logit_scale' parameter for CoOp prompt tuning.")
+        logit_scale = logit_scale_param.exp().item()
 
         for _ in range(max(1, steps)):
             assert self.optimizer is not None
