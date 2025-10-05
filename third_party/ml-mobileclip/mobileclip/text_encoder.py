@@ -170,7 +170,63 @@ class TextTransformer(nn.Module):
         mask = mask.unsqueeze(0)  # add dummy batch dimension
         mask = mask.expand(batch_size, -1, -1)
         return mask
+    # >>> 新增 for CoOp: 支援直接從 embeddings 起跑
+    def encode_from_embeddings(
+        self,
+        emb_seq: Tensor,
+        token_ids: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+        use_eot: bool = True,
+        add_positional: bool = True,
+        normalize: bool = True,
+        dtype: torch.dtype = torch.float32,
+    ) -> Tensor:
+        """
+        Args:
+            emb_seq: (B, T, D) 未加 positional 的序列（純 token embeddings）
+            token_ids: (B, T) optional, 若要用 EOT 索引
+            key_padding_mask: (B, T) optional
+            use_eot: 是否用 EOT 位置取句向量
+            add_positional: 是否加上 positional embedding
+            normalize: 是否做 L2 normalize
+        """
+        x = emb_seq
 
+        # 加 positional（與 encode_text 對齊）
+        if add_positional and self.positional_embedding is not None:
+            x = x + self.positional_embedding(x.size(1)).to(x.dtype)
+
+        # 建立 causal mask（與 encode_text 對齊）
+        attn_mask = None
+        if self.causal_masking:
+            attn_mask = self.build_attention_mask(
+                context_length=x.size(1), batch_size=x.size(0)
+            ).to(device=x.device, dtype=x.dtype)
+            key_padding_mask = None
+
+        # 疊 Transformer 層（與 encode_text 相同簽名）
+        for layer in self.transformer:
+            x = layer(
+                x,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+            )
+
+        # LayerNorm + 投影
+        x = self.final_layer_norm(x).to(dtype)
+
+        # 取句向量
+        if use_eot and token_ids is not None:
+            idx = token_ids.argmax(dim=-1)
+            x = x[torch.arange(x.size(0)), idx]
+        else:
+            x = x[:, -1, :]
+
+        x = x @ self.projection_layer
+
+        if normalize:
+            x = x / x.norm(p=2, dim=-1, keepdim=True)
+        return x
     def encode_text(
         self,
         text_tokens: Tensor,
